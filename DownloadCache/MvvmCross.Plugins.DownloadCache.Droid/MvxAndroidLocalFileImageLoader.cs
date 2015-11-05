@@ -23,6 +23,7 @@ namespace MvvmCross.Plugins.DownloadCache.Droid
         private const string ResourcePrefix = "res:";
         private readonly IDictionary<CacheKey, WeakReference<Bitmap>> _memCache =
             new Dictionary<CacheKey, WeakReference<Bitmap>>();
+		private readonly object _memCacheLock = new object ();
 
 
         public async Task<MvxImage<Bitmap>> Load(string localPath, bool shouldCache, int maxWidth, int maxHeight)
@@ -73,12 +74,13 @@ namespace MvvmCross.Plugins.DownloadCache.Droid
                 return null;
             }
 
-            return
-                await BitmapFactory.DecodeResourceAsync(resources, id,
-                    new BitmapFactory.Options {InPurgeable = true}).ConfigureAwait(false);
+			return await SafeLoadWithPurge (() =>
+                		BitmapFactory.DecodeResourceAsync(resources, id,
+							new BitmapFactory.Options {InPurgeable = true}))
+					.ConfigureAwait (false);
         }
 
-        private static async Task<Bitmap> LoadBitmapAsync(string localPath, int maxWidth, int maxHeight)
+        private async Task<Bitmap> LoadBitmapAsync(string localPath, int maxWidth, int maxHeight)
         {
             if (maxWidth > 0 || maxHeight > 0)
             {
@@ -93,7 +95,8 @@ namespace MvvmCross.Plugins.DownloadCache.Droid
 
                 // Decode bitmap with inSampleSize set
                 options.InJustDecodeBounds = false;
-                return await BitmapFactory.DecodeFileAsync(localPath, options).ConfigureAwait(false);
+				return await SafeLoadWithPurge (() => BitmapFactory.DecodeFileAsync(localPath, options))
+								.ConfigureAwait (false);
             }
             else
             {
@@ -106,9 +109,9 @@ namespace MvvmCross.Plugins.DownloadCache.Droid
                 // the InPurgeable option is very important for Droid memory management.
                 // see http://slodge.blogspot.co.uk/2013/02/huge-android-memory-bug-and-bug-hunting.html
                 var options = new BitmapFactory.Options { InPurgeable = true };
-                var image = await
-                    BitmapFactory.DecodeByteArrayAsync(contents, 0, contents.Length, options)
-                        .ConfigureAwait(false);
+				var image = await SafeLoadWithPurge (() =>
+                    			BitmapFactory.DecodeByteArrayAsync(contents, 0, contents.Length, options))
+							.ConfigureAwait (false);
                 return image;
             }
 
@@ -139,13 +142,64 @@ namespace MvvmCross.Plugins.DownloadCache.Droid
             return inSampleSize;
         }
 
+		private async Task<Bitmap> SafeLoadWithPurge (Func<Task<Bitmap>> bitmapFactoryFunc)
+		{
+			try
+			{
+				var bitmap = await bitmapFactoryFunc ().ConfigureAwait (false);
+				//MvxTrace.Trace (MvxTraceLevel.Diagnostic, "Bitmap loaded");
+				return bitmap;
+			}
+			catch (Java.Lang.Throwable vme)
+			{
+				MvxTrace.Trace (MvxTraceLevel.Warning, "Java.Throwable: " + vme.ToString ());
+				if (vme.Class == Java.Lang.Class.FromType(typeof(Java.Lang.OutOfMemoryError)))
+				{
+					Purge ();
+					return await bitmapFactoryFunc ().ConfigureAwait (false);
+				}
+				throw vme;
+			}
+		}
+
+		private void Purge ()
+		{
+			MvxTrace.Trace (MvxTraceLevel.Warning, "------ purge FileImageLoader cached images and force garbage collection");
+
+			lock (_memCacheLock)
+			{
+				foreach (var kvp in _memCache)
+				{
+					Bitmap bitmap;
+					if (kvp.Value.TryGetTarget (out bitmap))
+					{
+						// bitmap.Recycle (); // TODO Calling Recycle crashes system when bitmap is used
+						bitmap.Dispose ();
+					}
+				}
+				_memCache.Clear ();
+			}
+
+			// Force immediate Garbage collection. Please note that is resource intensive.
+			System.GC.Collect();
+			System.GC.WaitForPendingFinalizers ();
+			System.GC.WaitForPendingFinalizers (); // Double call since GC doesn't always find resources to be collected: https://bugzilla.xamarin.com/show_bug.cgi?id=20503
+			System.GC.Collect ();
+		}
+
         private bool TryGetCachedBitmap(string localPath, int maxWidth, int maxHeight, out Bitmap bitmap)
         {
             var key = new CacheKey(localPath, maxWidth, maxHeight);
             WeakReference<Bitmap> reference;
            
-            if (_memCache.TryGetValue(key, out reference))
-            {
+			bool hasValue = false;
+			lock (_memCacheLock)
+			{
+				hasValue = _memCache.TryGetValue (key, out reference);
+			}
+
+			if (hasValue)
+			{
                 Bitmap target;
                 if (reference.TryGetTarget(out target) && target != null && target.Handle != IntPtr.Zero && !target.IsRecycled)
                 {
@@ -153,7 +207,10 @@ namespace MvvmCross.Plugins.DownloadCache.Droid
                     return true;
                 }
                 
-                _memCache.Remove(key);    
+				lock (_memCacheLock) 
+				{
+					_memCache.Remove (key);
+				}
             }
 
             bitmap = null;
@@ -165,7 +222,10 @@ namespace MvvmCross.Plugins.DownloadCache.Droid
             if (bitmap == null) return;
             
             var key = new CacheKey(localPath, maxWidth, maxHeight);
-            _memCache[key] = new WeakReference<Bitmap>(bitmap);
+			lock (_memCacheLock) 
+			{
+				_memCache [key] = new WeakReference<Bitmap> (bitmap);
+			}
         }
 
         private class CacheKey
